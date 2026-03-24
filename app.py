@@ -1,114 +1,219 @@
-import os
 import json
+import os
 import pickle
-import joblib
+import sqlite3
+
 import pandas as pd
 from flask import Flask, jsonify, request
-from peewee import (
-    Model, IntegerField, FloatField,
-    TextField, IntegrityError
-)
-from playhouse.shortcuts import model_to_dict
-from playhouse.db_url import connect
 
-
-########################################
-# Begin database stuff
-
-# The connect function checks if there is a DATABASE_URL env var.
-# If it exists, it uses it to connect to a remote postgres db.
-# Otherwise, it connects to a local sqlite db stored in predictions.db.
-DB = connect(os.environ.get('DATABASE_URL') or 'sqlite:///predictions.db')
-
-class Prediction(Model):
-    observation_id = IntegerField(unique=True)
-    observation = TextField()
-    proba = FloatField()
-    true_class = IntegerField(null=True)
-
-    class Meta:
-        database = DB
-
-
-DB.create_tables([Prediction], safe=True)
-
-# End database stuff
-########################################
-
-########################################
-# Unpickle the previously-trained model
-
-
-with open('columns.json') as fh:
-    columns = json.load(fh)
-
-pipeline = joblib.load('pipeline.pickle')
-
-with open('dtypes.pickle', 'rb') as fh:
-    dtypes = pickle.load(fh)
-
-
-# End model un-pickling
-########################################
-
-
-########################################
-# Begin webserver stuff
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 app = Flask(__name__)
 
+DB_PATH = os.path.join(BASE_DIR, "database.db")
+COLUMNS_PATH = os.path.join(BASE_DIR, "columns.json")
+DTYPES_PATH = os.path.join(BASE_DIR, "dtypes.pickle")
+PIPELINE_PATH = os.path.join(BASE_DIR, "pipeline.pickle")
 
-@app.route('/predict', methods=['POST'])
-def predict():
-    # Flask provides a deserialization convenience function called
-    # get_json that will work if the mimetype is application/json.
-    obs_dict = request.get_json()
-    _id = obs_dict['id']
-    observation = obs_dict['observation']
-    # Now do what we already learned in the notebooks about how to transform
-    # a single observation into a dataframe that will work with a pipeline.
-    obs = pd.DataFrame([observation], columns=columns).astype(dtypes)
-    # Now get ourselves an actual prediction of the positive class.
-    proba = pipeline.predict_proba(obs)[0, 1]
-    response = {'proba': proba}
-    p = Prediction(
-        observation_id=_id,
-        proba=proba,
-        observation=request.data
+
+def load_columns():
+    with open(COLUMNS_PATH, "r") as f:
+        return json.load(f)
+
+
+def load_dtypes():
+    with open(DTYPES_PATH, "rb") as f:
+        return pickle.load(f)
+
+
+def load_pipeline():
+    with open(PIPELINE_PATH, "rb") as f:
+        return pickle.load(f)
+
+
+COLUMNS = load_columns()
+DTYPES = load_dtypes()
+PIPELINE = load_pipeline()
+
+
+def get_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def initialize_db():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS predictions (
+            id TEXT PRIMARY KEY,
+            observation TEXT NOT NULL,
+            proba REAL NOT NULL,
+            true_class TEXT
+        )
+        """
     )
+
+    conn.commit()
+    conn.close()
+
+
+def observation_is_valid(observation):
+    if not isinstance(observation, dict):
+        return False
+
+    required_fields = ["age", "education", "hours-per-week", "native-country"]
+
+    if set(observation.keys()) != set(required_fields):
+        return False
+
+    # age must be integer-like
+    if not isinstance(observation["age"], int):
+        return False
+
+    # education must be string
+    if not isinstance(observation["education"], str):
+        return False
+
+    # hours-per-week must be integer-like
+    if not isinstance(observation["hours-per-week"], int):
+        return False
+
+    # native-country must be string
+    if not isinstance(observation["native-country"], str):
+        return False
+
+    return True
+
+
+def make_dataframe_from_observation(observation):
+    df = pd.DataFrame([observation], columns=COLUMNS)
+
+    # enforce training dtypes
+    for col in COLUMNS:
+        df[col] = df[col].astype(DTYPES[col])
+
+    return df
+
+
+def get_existing_prediction(obs_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT id, observation, proba, true_class FROM predictions WHERE id = ?",
+        (str(obs_id),)
+    )
+    row = cursor.fetchone()
+    conn.close()
+
+    return row
+
+
+def insert_prediction(obs_id, observation, proba):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO predictions (id, observation, proba, true_class)
+        VALUES (?, ?, ?, ?)
+        """,
+        (str(obs_id), json.dumps(observation), float(proba), None)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+@app.route("/predict", methods=["POST"])
+def predict():
+    payload = request.get_json()
+
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Invalid request payload!"}), 400
+
+    if "id" not in payload or "observation" not in payload:
+        return jsonify({"error": "Invalid request payload!"}), 400
+
+    obs_id = payload["id"]
+    observation = payload["observation"]
+
+    if not observation_is_valid(observation):
+        return jsonify({"error": "Observation is invalid!"}), 400
+
     try:
-        p.save()
-    except IntegrityError:
-        error_msg = f'Observation ID {_id} already exists'
-        response['error'] = error_msg
-        print(error_msg)
-        DB.rollback()
-    return jsonify(response)
+        observation_df = make_dataframe_from_observation(observation)
+        proba = PIPELINE.predict_proba(observation_df)[0, 1]
+    except Exception:
+        return jsonify({"error": "Observation is invalid!"}), 400
 
+    existing_row = get_existing_prediction(obs_id)
 
-@app.route('/update', methods=['POST'])
+    if existing_row is not None:
+        return jsonify({
+            "error": f'Observation ID: "{obs_id}" already exists',
+            "proba": existing_row["proba"]
+        }), 200
+
+    insert_prediction(obs_id, observation, proba)
+
+    return jsonify({"proba": proba}), 200
+
+@app.route("/update", methods=["POST"])
 def update():
-    obs = request.get_json()
-    try:
-        p = Prediction.get(Prediction.observation_id == obs['id'])
-        p.true_class = obs['true_class']
-        p.save()
-        return jsonify(model_to_dict(p))
-    except Prediction.DoesNotExist:
-        error_msg = f'Observation ID {obs['id']} does not exist'
-        return jsonify({'error': error_msg})
+    payload = request.get_json()
 
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Invalid request payload!"}), 400
 
-@app.route('/list-db-contents')
-def list_db_contents():
-    return jsonify([
-        model_to_dict(obs) for obs in Prediction.select()
-    ])
+    if "id" not in payload or "true_class" not in payload:
+        return jsonify({"error": "Invalid request payload!"}), 400
 
+    obs_id = payload["id"]
+    true_class = payload["true_class"]
 
-# End webserver stuff
-########################################
+    if true_class not in [0, 1]:
+        return jsonify({"error": "true_class is invalid!"}), 400
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT id, observation, proba, true_class FROM predictions WHERE id = ?",
+        (str(obs_id),)
+    )
+    row = cursor.fetchone()
+
+    if row is None:
+        conn.close()
+        return jsonify({
+            "error": f'Observation ID: "{obs_id}" does not exist'
+        }), 404
+
+    cursor.execute(
+        "UPDATE predictions SET true_class = ? WHERE id = ?",
+        (true_class, str(obs_id))
+    )
+    conn.commit()
+
+    cursor.execute(
+        "SELECT id, observation, proba, true_class FROM predictions WHERE id = ?",
+        (str(obs_id),)
+    )
+    updated_row = cursor.fetchone()
+    conn.close()
+
+    return jsonify({
+        "id": int(updated_row["id"]),
+        "observation": updated_row["observation"],
+        "proba": updated_row["proba"],
+        "true_class": int(updated_row["true_class"]) if updated_row["true_class"] is not None else None
+    }), 200
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', debug=True, port=5000)
-
+    initialize_db()
+    app.run(host="0.0.0.0", port=5000, debug=True)
