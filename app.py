@@ -2,36 +2,12 @@ import json
 import os
 import pickle
 
+import joblib
+import numpy as np
 import pandas as pd
-from flask import Flask, request, jsonify
-from peewee import (
-    SqliteDatabase, Model, IntegerField,
-    FloatField, TextField, IntegrityError
-)
-from playhouse.shortcuts import model_to_dict
-
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
-
-
-# =========================
-# Database
-# =========================
-DB = SqliteDatabase("predictions.db")
-
-
-class Prediction(Model):
-    observation_id = IntegerField(unique=True)
-    observation = TextField()
-    proba = FloatField()
-    true_class = IntegerField(null=True)
-
-    class Meta:
-        database = DB
-
-
-DB.connect(reuse_if_open=True)
-DB.create_tables([Prediction], safe=True)
 
 
 # =========================
@@ -44,113 +20,135 @@ with open("dtypes.pickle", "rb") as fh:
     dtypes = pickle.load(fh)
 
 with open("pipeline.pickle", "rb") as fh:
-    pipeline = pickle.load(fh)
+    pipeline = joblib.load(fh)
 
 
 # =========================
-# Helpers
+# Reference categories
 # =========================
-def is_valid_observation(observation):
-    if not isinstance(observation, dict):
-        return False
+# These come from the Adult/Bank dataset categories used in the notebook.
+# Keeping them explicit avoids needing the training CSV at runtime.
+VALID_CATEGORIES = {
+    "workclass": [
+        "Private", "Self-emp-not-inc", "Self-emp-inc", "Federal-gov",
+        "Local-gov", "State-gov", "Without-pay", "Never-worked"
+    ],
+    "education": [
+        "Bachelors", "Some-college", "11th", "HS-grad", "Prof-school",
+        "Assoc-acdm", "Assoc-voc", "9th", "7th-8th", "12th", "Masters",
+        "1st-4th", "10th", "Doctorate", "5th-6th", "Preschool"
+    ],
+    "marital-status": [
+        "Married-civ-spouse", "Divorced", "Never-married", "Separated",
+        "Widowed", "Married-spouse-absent", "Married-AF-spouse"
+    ],
+    "race": [
+        "White", "Asian-Pac-Islander", "Amer-Indian-Eskimo", "Other", "Black"
+    ],
+    "sex": [
+        "Female", "Male"
+    ],
+}
 
-    expected_keys = {"age", "education", "hours-per-week", "native-country"}
-    if set(observation.keys()) != expected_keys:
-        return False
-
-    if not isinstance(observation["age"], int):
-        return False
-
-    if not isinstance(observation["education"], str):
-        return False
-
-    if not isinstance(observation["hours-per-week"], int):
-        return False
-
-    if not isinstance(observation["native-country"], str):
-        return False
-
-    return True
+REQUIRED_FIELDS = [
+    "age",
+    "workclass",
+    "education",
+    "marital-status",
+    "race",
+    "sex",
+    "capital-gain",
+    "capital-loss",
+    "hours-per-week",
+]
 
 
-# =========================
-# /predict
-# =========================
+def error_response(observation_id, message, status_code=400):
+    return jsonify({
+        "observation_id": observation_id,
+        "error": message
+    }), status_code
+
+
+def validate_payload(payload):
+    if not isinstance(payload, dict):
+        return None, "Invalid request format"
+
+    if "observation_id" not in payload:
+        return None, "Missing observation_id"
+
+    observation_id = payload["observation_id"]
+
+    if "data" not in payload:
+        return observation_id, "Missing data"
+
+    data = payload["data"]
+    if not isinstance(data, dict):
+        return observation_id, "Invalid data format"
+
+    for field in REQUIRED_FIELDS:
+        if field not in data:
+            return observation_id, f"Missing field: {field}"
+
+    for field in data:
+        if field not in REQUIRED_FIELDS:
+            return observation_id, f"Unexpected field: {field}"
+
+    for col, valid_values in VALID_CATEGORIES.items():
+        if data[col] not in valid_values:
+            return observation_id, f"Invalid value for {col}: {data[col]}"
+
+    try:
+        age = float(data["age"])
+        capital_gain = float(data["capital-gain"])
+        capital_loss = float(data["capital-loss"])
+        hours = float(data["hours-per-week"])
+    except Exception:
+        return observation_id, "Invalid numeric values"
+
+    if not (0 <= age <= 100):
+        return observation_id, f"Invalid value for age: {data['age']}"
+
+    if capital_gain < 0:
+        return observation_id, f"Invalid value for capital-gain: {data['capital-gain']}"
+
+    if capital_loss < 0:
+        return observation_id, f"Invalid value for capital-loss: {data['capital-loss']}"
+
+    if not (0 <= hours <= 168):
+        return observation_id, f"Invalid value for hours-per-week: {data['hours-per-week']}"
+
+    return observation_id, None
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"status": "ok"}), 200
+
+
 @app.route("/predict", methods=["POST"])
 def predict():
-    payload = request.get_json()
+    payload = request.get_json(silent=True)
 
-    if not isinstance(payload, dict):
-        return jsonify({"error": "Invalid request payload!"}), 400
+    observation_id, validation_error = validate_payload(payload)
+    if validation_error is not None:
+        return error_response(observation_id, validation_error, 400)
 
-    if "id" not in payload or "observation" not in payload:
-        return jsonify({"error": "Invalid request payload!"}), 400
-
-    _id = payload["id"]
-    observation = payload["observation"]
-
-    if not is_valid_observation(observation):
-        return jsonify({"error": "Observation is invalid!"}), 400
+    data = payload["data"]
 
     try:
-        obs = pd.DataFrame([observation], columns=columns).astype(dtypes)
-        proba = float(pipeline.predict_proba(obs)[0, 1])
-    except Exception:
-        return jsonify({"error": "Observation is invalid!"}), 400
+        X = pd.DataFrame([[data[col] for col in columns]], columns=columns).astype(dtypes)
+        pred = pipeline.predict(X)[0]
+        proba = pipeline.predict_proba(X)[0, 1]
+    except Exception as e:
+        return error_response(observation_id, f"Prediction failed: {str(e)}", 400)
 
-    response = {"proba": proba}
-
-    p = Prediction(
-        observation_id=_id,
-        observation=json.dumps(observation),
-        proba=proba,
-        true_class=None
-    )
-
-    try:
-        p.save()
-    except IntegrityError:
-        existing = Prediction.get(Prediction.observation_id == _id)
-        response["error"] = f'Observation ID: "{_id}" already exists'
-        response["proba"] = existing.proba
-
-    return jsonify(response)
-
-
-# =========================
-# /update
-# =========================
-@app.route("/update", methods=["POST"])
-def update():
-    payload = request.get_json()
-
-    if not isinstance(payload, dict):
-        return jsonify({"error": "Invalid request payload!"}), 400
-
-    if "id" not in payload or "true_class" not in payload:
-        return jsonify({"error": "Invalid request payload!"}), 400
-
-    _id = payload["id"]
-    true_class = payload["true_class"]
-
-    if true_class not in [0, 1]:
-        return jsonify({"error": "true_class is invalid!"}), 400
-
-    try:
-        p = Prediction.get(Prediction.observation_id == _id)
-        p.true_class = true_class
-        p.save()
-
-        result = model_to_dict(p)
-        result["id"] = result["id"]
-        result["observation_id"] = int(result["observation_id"])
-        result["true_class"] = int(result["true_class"]) if result["true_class"] is not None else None
-
-        return jsonify(result)
-
-    except Prediction.DoesNotExist:
-        return jsonify({"error": f'Observation ID: "{_id}" does not exist'}), 404
+    return jsonify({
+        "observation_id": observation_id,
+        "prediction": bool(pred),
+        "probability": float(proba)
+    }), 200
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
