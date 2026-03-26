@@ -3,7 +3,6 @@ import os
 import pickle
 
 import joblib
-import numpy as np
 import pandas as pd
 from flask import Flask, jsonify, request
 
@@ -24,32 +23,8 @@ with open("pipeline.pickle", "rb") as fh:
 
 
 # =========================
-# Reference categories
+# Expected schema
 # =========================
-# These come from the Adult/Bank dataset categories used in the notebook.
-# Keeping them explicit avoids needing the training CSV at runtime.
-VALID_CATEGORIES = {
-    "workclass": [
-        "Private", "Self-emp-not-inc", "Self-emp-inc", "Federal-gov",
-        "Local-gov", "State-gov", "Without-pay", "Never-worked"
-    ],
-    "education": [
-        "Bachelors", "Some-college", "11th", "HS-grad", "Prof-school",
-        "Assoc-acdm", "Assoc-voc", "9th", "7th-8th", "12th", "Masters",
-        "1st-4th", "10th", "Doctorate", "5th-6th", "Preschool"
-    ],
-    "marital-status": [
-        "Married-civ-spouse", "Divorced", "Never-married", "Separated",
-        "Widowed", "Married-spouse-absent", "Married-AF-spouse"
-    ],
-    "race": [
-        "White", "Asian-Pac-Islander", "Amer-Indian-Eskimo", "Other", "Black"
-    ],
-    "sex": [
-        "Female", "Male"
-    ],
-}
-
 REQUIRED_FIELDS = [
     "age",
     "workclass",
@@ -62,12 +37,68 @@ REQUIRED_FIELDS = [
     "hours-per-week",
 ]
 
+VALID_CATEGORIES = {
+    "workclass": [
+        "Private",
+        "Self-emp-not-inc",
+        "Self-emp-inc",
+        "Federal-gov",
+        "Local-gov",
+        "State-gov",
+        "Without-pay",
+        "Never-worked",
+    ],
+    "education": [
+        "Bachelors",
+        "Some-college",
+        "11th",
+        "HS-grad",
+        "Prof-school",
+        "Assoc-acdm",
+        "Assoc-voc",
+        "9th",
+        "7th-8th",
+        "12th",
+        "Masters",
+        "1st-4th",
+        "10th",
+        "Doctorate",
+        "5th-6th",
+        "Preschool",
+    ],
+    "marital-status": [
+        "Married-civ-spouse",
+        "Divorced",
+        "Never-married",
+        "Separated",
+        "Widowed",
+        "Married-spouse-absent",
+        "Married-AF-spouse",
+    ],
+    "race": [
+        "White",
+        "Asian-Pac-Islander",
+        "Amer-Indian-Eskimo",
+        "Other",
+        "Black",
+    ],
+    "sex": [
+        "Female",
+        "Male",
+    ],
+}
 
-def error_response(observation_id, message, status_code=400):
-    return jsonify({
-        "observation_id": observation_id,
-        "error": message
-    }), status_code
+
+# =========================
+# Helpers
+# =========================
+def error_response(observation_id, message):
+    return jsonify(
+        {
+            "observation_id": observation_id,
+            "error": message,
+        }
+    ), 200
 
 
 def validate_payload(payload):
@@ -83,6 +114,7 @@ def validate_payload(payload):
         return observation_id, "Missing data"
 
     data = payload["data"]
+
     if not isinstance(data, dict):
         return observation_id, "Invalid data format"
 
@@ -102,7 +134,7 @@ def validate_payload(payload):
         age = float(data["age"])
         capital_gain = float(data["capital-gain"])
         capital_loss = float(data["capital-loss"])
-        hours = float(data["hours-per-week"])
+        hours_per_week = float(data["hours-per-week"])
     except Exception:
         return observation_id, "Invalid numeric values"
 
@@ -115,12 +147,15 @@ def validate_payload(payload):
     if capital_loss < 0:
         return observation_id, f"Invalid value for capital-loss: {data['capital-loss']}"
 
-    if not (0 <= hours <= 168):
+    if not (0 <= hours_per_week <= 168):
         return observation_id, f"Invalid value for hours-per-week: {data['hours-per-week']}"
 
     return observation_id, None
 
 
+# =========================
+# Routes
+# =========================
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({"status": "ok"}), 200
@@ -132,7 +167,7 @@ def predict():
 
     observation_id, validation_error = validate_payload(payload)
     if validation_error is not None:
-        return error_response(observation_id, validation_error, 400)
+        return error_response(observation_id, validation_error)
 
     data = payload["data"]
 
@@ -141,13 +176,15 @@ def predict():
         pred = pipeline.predict(X)[0]
         proba = pipeline.predict_proba(X)[0, 1]
     except Exception as e:
-        return error_response(observation_id, f"Prediction failed: {str(e)}", 400)
+        return error_response(observation_id, f"Prediction failed: {str(e)}")
 
-    return jsonify({
-        "observation_id": observation_id,
-        "prediction": bool(pred),
-        "probability": float(proba)
-    }), 200
+    return jsonify(
+        {
+            "observation_id": observation_id,
+            "prediction": bool(pred),
+            "probability": float(proba),
+        }
+    ), 200
 
 
 if __name__ == "__main__":
